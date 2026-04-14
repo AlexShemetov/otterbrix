@@ -9,11 +9,38 @@
 #include <components/physical_plan/operators/aggregate/operator_func.hpp>
 #include <components/physical_plan/operators/operator_batch.hpp>
 #include <core/operations_helper.hpp>
+#include <future>
 #include <type_traits>
 
 namespace components::operators {
 
     namespace {
+        struct aggregate_partition_t {
+            uint64_t cpu_offset{0};
+            uint64_t cpu_count{0};
+            uint64_t gpu_offset{0};
+            uint64_t gpu_count{0};
+
+            [[nodiscard]] bool use_cpu() const noexcept { return cpu_count > 0; }
+            [[nodiscard]] bool use_gpu() const noexcept { return gpu_count > 0; }
+            [[nodiscard]] bool hybrid() const noexcept { return use_cpu() && use_gpu(); }
+        };
+
+        aggregate_partition_t plan_aggregate_partition(uint64_t row_count, bool gpu_enabled) {
+            if (!gpu_enabled || row_count == 0) {
+                return {0, row_count, 0, 0};
+            }
+
+            if (row_count == 1) {
+                return {0, 0, 0, 1};
+            }
+
+            auto gpu_count = std::max<uint64_t>(1, (row_count * 3) / 4);
+            gpu_count = std::min(gpu_count, row_count - 1);
+            const auto cpu_count = row_count - gpu_count;
+            return {0, cpu_count, cpu_count, gpu_count};
+        }
+
         template<typename T>
         bool equals_typed(const vector::vector_t& vec, size_t row, const types::logical_value_t& val) {
             if constexpr (std::is_floating_point_v<T>) {
@@ -470,6 +497,9 @@ namespace components::operators {
                     break;
                 }
                 auto kind = aggregate::classify(func_op->func()->name());
+                if (kind == aggregate::builtin_agg::UNKNOWN && func_op->func()->has_gpu_udf_kind()) {
+                    kind = aggregate::classify(func_op->func()->gpu_udf_kind());
+                }
                 if (kind == aggregate::builtin_agg::UNKNOWN) {
                     can_vectorize = false;
                     break;
@@ -518,40 +548,134 @@ namespace components::operators {
                     group_ids[row_id] = static_cast<uint32_t>(g);
                 }
             }
+            const auto partition =
+                plan_aggregate_partition(num_rows, aggregate::gpu_group_aggregate_test_enabled());
 
-            // For each aggregate, run vectorized update
-            std::pmr::vector<std::pmr::vector<types::logical_value_t>> agg_results(resource_);
-            agg_results.reserve(values_.size());
-
+            std::pmr::vector<types::complex_logical_type> out_types(resource_);
+            out_types.reserve(key_count + values_.size());
+            if (num_groups > 0) {
+                for (size_t k = 0; k < key_count; k++) {
+                    out_types.push_back(group_keys_[0][k].type());
+                }
+            }
             for (size_t a = 0; a < values_.size(); a++) {
-                std::pmr::vector<aggregate::raw_agg_state_t> states(resource_);
-                states.resize(num_groups);
-
-                auto& info = agg_infos[a];
-                if (info.is_count_star) {
-                    // COUNT(*): count all rows per group (including nulls)
-                    for (uint64_t i = 0; i < num_rows; i++) {
-                        if (group_ids[i] != UINT32_MAX) {
-                            states[group_ids[i]].update_count();
-                        }
-                    }
-                } else {
-                    aggregate::update_all(info.kind, *chunk.at(info.full_path), group_ids.data(), num_rows, states);
-                }
-
-                // Finalize states to logical_value_t
-                std::pmr::vector<types::logical_value_t> results(resource_);
-                results.reserve(num_groups);
-                for (size_t g = 0; g < num_groups; g++) {
-                    auto val = aggregate::finalize_state(resource_, info.kind, states[g], info.col_type);
-                    val.set_alias(std::string(values_[a].name));
-                    results.push_back(std::move(val));
-                }
-                agg_results.push_back(std::move(results));
+                out_types.push_back(aggregate::result_type(agg_infos[a].kind, agg_infos[a].col_type));
             }
 
-            // Build result chunk
-            return build_result_chunk(num_groups, key_count, agg_results);
+            uint64_t cap = num_groups > 0 ? static_cast<uint64_t>(num_groups) : 1;
+            vector::data_chunk_t result(resource_, out_types, cap);
+            result.set_cardinality(static_cast<uint64_t>(num_groups));
+
+            for (size_t group_idx = 0; group_idx < num_groups; group_idx++) {
+                for (size_t key_idx = 0; key_idx < key_count; key_idx++) {
+                    result.set_value(key_idx, group_idx, std::move(group_keys_[group_idx][key_idx]));
+                }
+            }
+
+            std::pmr::vector<std::pmr::vector<aggregate::raw_agg_state_t>> states_per_agg(resource_);
+            states_per_agg.reserve(values_.size());
+            for (size_t a = 0; a < values_.size(); a++) {
+                states_per_agg.push_back(std::pmr::vector<aggregate::raw_agg_state_t>(resource_));
+                states_per_agg.back().resize(num_groups);
+            }
+
+            std::pmr::vector<std::pmr::vector<aggregate::raw_agg_state_t>> gpu_states_per_agg(resource_);
+            if (partition.hybrid()) {
+                gpu_states_per_agg.reserve(values_.size());
+                for (size_t a = 0; a < values_.size(); a++) {
+                    gpu_states_per_agg.push_back(std::pmr::vector<aggregate::raw_agg_state_t>(resource_));
+                    gpu_states_per_agg.back().resize(num_groups);
+                }
+            }
+
+            std::pmr::vector<aggregate::gpu_update_request_t> gpu_requests(resource_);
+            gpu_requests.reserve(values_.size());
+
+            std::pmr::vector<std::pmr::vector<size_t>> gpu_input_paths(resource_);
+            gpu_input_paths.reserve(values_.size());
+
+            auto gpu_input_id = [&](const std::pmr::vector<size_t>& path) {
+                for (size_t index = 0; index < gpu_input_paths.size(); index++) {
+                    if (gpu_input_paths[index] == path) {
+                        return static_cast<uint32_t>(index);
+                    }
+                }
+                gpu_input_paths.push_back(std::pmr::vector<size_t>(resource_));
+                gpu_input_paths.back() = path;
+                return static_cast<uint32_t>(gpu_input_paths.size() - 1);
+            };
+
+            std::pmr::vector<vector::vector_t> gpu_slices(resource_);
+            if (partition.hybrid()) {
+                gpu_slices.reserve(values_.size());
+            }
+
+            for (size_t a = 0; a < values_.size(); a++) {
+                auto& info = agg_infos[a];
+                auto& states = states_per_agg[a];
+
+                if (partition.use_cpu()) {
+                    if (info.is_count_star) {
+                        aggregate::update_count_star(
+                            group_ids.data() + partition.cpu_offset, partition.cpu_count, states);
+                    } else {
+                        const auto* source = chunk.at(info.full_path);
+                        if (partition.hybrid()) {
+                            vector::vector_t cpu_slice(*source, partition.cpu_offset, partition.cpu_count);
+                            aggregate::update_all(
+                                info.kind, cpu_slice, group_ids.data() + partition.cpu_offset, partition.cpu_count, states);
+                        } else {
+                            aggregate::update_all(info.kind, *source, group_ids.data(), num_rows, states);
+                        }
+                    }
+                }
+
+                if (partition.use_gpu()) {
+                    aggregate::gpu_update_request_t request{};
+                    request.kind = info.kind;
+                    request.is_count_star = info.is_count_star;
+                    request.states = partition.hybrid() ? &gpu_states_per_agg[a] : &states_per_agg[a];
+
+                    if (!info.is_count_star) {
+                        request.input_id = gpu_input_id(info.full_path);
+                        if (partition.hybrid()) {
+                            gpu_slices.emplace_back(*chunk.at(info.full_path), partition.gpu_offset, partition.gpu_count);
+                            request.vec = &gpu_slices.back();
+                        } else {
+                            request.vec = chunk.at(info.full_path);
+                        }
+                    }
+
+                    gpu_requests.push_back(request);
+                }
+            }
+
+            if (partition.use_gpu() && !gpu_requests.empty()) {
+                const auto* gpu_group_ids = group_ids.data() + partition.gpu_offset;
+                const auto gpu_row_count = partition.hybrid() ? partition.gpu_count : num_rows;
+                aggregate::update_batch_gpu(gpu_requests.data(), gpu_requests.size(), gpu_group_ids, gpu_row_count);
+            }
+
+            if (partition.hybrid()) {
+                for (size_t a = 0; a < values_.size(); a++) {
+                    auto& info = agg_infos[a];
+                    auto& states = states_per_agg[a];
+                    auto& gpu_states = gpu_states_per_agg[a];
+                    for (size_t g = 0; g < num_groups; g++) {
+                        aggregate::merge_state(info.kind, states[g], gpu_states[g]);
+                    }
+                }
+            }
+
+            for (size_t a = 0; a < values_.size(); a++) {
+                auto& info = agg_infos[a];
+                auto& states = states_per_agg[a];
+                for (size_t g = 0; g < num_groups; g++) {
+                    aggregate::write_finalized_state(result.data[key_count + a], g, info.kind, states[g], info.col_type);
+                }
+            }
+
+            return result;
         }
 
         // Fallback: gather + slice_contiguous per group
